@@ -46,11 +46,25 @@ def _progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=True):
     return InfoTaskProgressEvent(slot=device.slot, pid=device.pid, step_name=step_name, success=success, device=device)
 
 
+def _drain_timers():
+    import threading
+    import time
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        timers = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+        if not timers:
+            return
+        for t in timers:
+            t.join(timeout=0.1)
+
+
 def test_logs_fully_discovered_when_no_pending_on_success(caplog):
     device = _make_device(pending=set())
     orch, topics, _ = _make_orchestrator()
 
     import logging
+
     with caplog.at_level(logging.INFO):
         orch.notify(_progress(device, success=True))
 
@@ -62,20 +76,25 @@ def test_no_log_when_pending_steps_remain_on_success(caplog):
     orch, topics, _ = _make_orchestrator()
 
     import logging
+
     with caplog.at_level(logging.INFO):
         orch.notify(_progress(device, success=True))
 
     assert "fully discovered" not in caplog.text.lower()
 
 
-def test_retries_immediately_when_device_connected():
+def test_retries_when_device_connected():
     device = _make_device(pending={Task.Feature.Name.CID_REPORTING}, connected=True)
     orch, topics, _ = _make_orchestrator()
 
-    with patch("src.cleverswitch.subscriber.info_task_orchestrator._TASK_FACTORIES") as mock_factories:
+    with (
+        patch("src.cleverswitch.subscriber.info_task_orchestrator._TASK_FACTORIES") as mock_factories,
+        patch("src.cleverswitch.subscriber.info_task_orchestrator.RETRY_BASE_DELAY", 0.0),
+    ):
         mock_task = MagicMock()
         mock_factories.__getitem__ = MagicMock(return_value=MagicMock(return_value=mock_task))
         orch.notify(_progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=False))
+        _drain_timers()
         mock_task.start.assert_called_once()
 
 
@@ -83,11 +102,75 @@ def test_no_retry_when_device_disconnected():
     device = _make_device(pending={Task.Feature.Name.CID_REPORTING}, connected=False)
     orch, topics, _ = _make_orchestrator()
 
-    with patch("src.cleverswitch.subscriber.info_task_orchestrator._TASK_FACTORIES") as mock_factories:
+    with (
+        patch("src.cleverswitch.subscriber.info_task_orchestrator._TASK_FACTORIES") as mock_factories,
+        patch("src.cleverswitch.subscriber.info_task_orchestrator.RETRY_BASE_DELAY", 0.0),
+    ):
         mock_task = MagicMock()
         mock_factories.__getitem__ = MagicMock(return_value=MagicMock(return_value=mock_task))
         orch.notify(_progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=False))
+        _drain_timers()
         mock_task.start.assert_not_called()
+
+
+def test_retry_delay_backs_off_exponentially():
+    device = _make_device(pending={Task.Feature.Name.CID_REPORTING}, connected=True)
+    orch, topics, _ = _make_orchestrator()
+
+    delays = []
+    with patch("src.cleverswitch.subscriber.info_task_orchestrator.threading.Timer") as mock_timer:
+        for _ in range(3):
+            orch.notify(_progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=False))
+        delays = [call.args[0] for call in mock_timer.call_args_list]
+
+    assert delays == [0.5, 1.0, 2.0]
+
+
+def test_retry_delay_capped_at_max():
+    device = _make_device(pending={Task.Feature.Name.CID_REPORTING}, connected=True)
+    orch, topics, _ = _make_orchestrator()
+
+    with (
+        patch("src.cleverswitch.subscriber.info_task_orchestrator.threading.Timer") as mock_timer,
+        patch("src.cleverswitch.subscriber.info_task_orchestrator.RETRY_MAX_ATTEMPTS", 10),
+    ):
+        for _ in range(10):
+            orch.notify(_progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=False))
+        delays = [call.args[0] for call in mock_timer.call_args_list]
+
+    assert max(delays) == 10.0
+    assert delays[-1] == 10.0
+
+
+def test_retry_stops_after_max_attempts(caplog):
+    import logging
+
+    device = _make_device(pending={Task.Feature.Name.CID_REPORTING}, connected=True)
+    orch, topics, _ = _make_orchestrator()
+
+    with patch("src.cleverswitch.subscriber.info_task_orchestrator.threading.Timer") as mock_timer:
+        for _ in range(5):
+            orch.notify(_progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=False))
+        assert mock_timer.call_count == 5
+
+        with caplog.at_level(logging.WARNING):
+            orch.notify(_progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=False))
+
+        assert mock_timer.call_count == 5  # no further timer scheduled
+        assert "giving up" in caplog.text.lower()
+
+
+def test_retry_attempts_reset_on_success():
+    device = _make_device(pending={Task.Feature.Name.CID_REPORTING}, connected=True)
+    orch, topics, _ = _make_orchestrator()
+
+    with patch("src.cleverswitch.subscriber.info_task_orchestrator.threading.Timer") as mock_timer:
+        orch.notify(_progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=False))
+        orch.notify(_progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=True))
+        orch.notify(_progress(device, step_name=Task.Feature.Name.CID_REPORTING, success=False))
+        delays = [call.args[0] for call in mock_timer.call_args_list]
+
+    assert delays == [0.5, 0.5]  # second failure restarts from base delay
 
 
 def test_logs_fully_discovered_only_once_per_device(caplog):
@@ -95,6 +178,7 @@ def test_logs_fully_discovered_only_once_per_device(caplog):
     orch, topics, _ = _make_orchestrator()
 
     import logging
+
     with caplog.at_level(logging.INFO):
         orch.notify(_progress(device, step_name=Task.Name.GET_DEVICE_NAME, success=True))
         orch.notify(_progress(device, step_name=Task.Name.GET_DEVICE_TYPE, success=True))

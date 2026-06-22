@@ -38,7 +38,12 @@ class InfoTask(ABC, Subscriber, Thread):
         topics.hid_event.subscribe(self)
 
     def notify(self, event) -> None:
-        if isinstance(event, HidppErrorEvent) and event.slot == self._device.slot:
+        if (
+            isinstance(event, HidppErrorEvent)
+            and event.slot == self._device.slot
+            and event.pid == self._device.pid
+            and event.sw_id == self._sw_id
+        ):
             self._response_queue.put(event)
             return
         if (
