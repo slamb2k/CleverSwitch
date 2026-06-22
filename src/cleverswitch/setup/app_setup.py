@@ -48,13 +48,12 @@ def _load_config(args: argparse.Namespace) -> Config:
 
 
 def _setup_shutdown() -> threading.Event:
-    # Graceful shutdown on Ctrl-C / SIGTERM
+    # Graceful shutdown on Ctrl-C / SIGTERM, plus SIGHUP/SIGQUIT where the platform provides them
     shutdown = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: shutdown.set())
-    signal.signal(signal.SIGTERM, lambda *_: shutdown.set())
-    if get_system() != "Windows":
-        signal.signal(signal.SIGHUP, lambda *_: shutdown.set())  # todo not present in windows
-        signal.signal(signal.SIGQUIT, lambda *_: shutdown.set())  # todo not present in windows
+    for sig_name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            signal.signal(sig, lambda *_: shutdown.set())
     return shutdown
 
 
