@@ -8,8 +8,7 @@ import sys
 import pytest
 
 from src.cleverswitch.cli.cli_module import _parse_args, _setup_logging, main
-from src.cleverswitch.errors.errors import CleverSwitchError
-
+from src.cleverswitch.errors.errors import AlreadyRunningError, CleverSwitchError
 
 # ── _parse_args() ─────────────────────────────────────────────────────────────
 
@@ -68,6 +67,7 @@ def test_main_starts_discovery_thread_in_normal_mode(mocker, monkeypatch):
     mock_context = mocker.MagicMock()
     mocker.patch("cleverswitch.cli.cli_module.setup_context", return_value=mock_context)
     mocker.patch("cleverswitch.cli.cli_module._setup_logging")
+    mocker.patch("cleverswitch.cli.cli_module.acquire_single_instance_lock")
     mock_thread_cls = mocker.patch("cleverswitch.cli.cli_module.threading.Thread")
     mock_thread = mock_thread_cls.return_value
 
@@ -83,9 +83,25 @@ def test_main_exits_with_code_1_on_clever_switch_error(mocker, monkeypatch):
     mock_context = mocker.MagicMock()
     mocker.patch("src.cleverswitch.cli.cli_module.setup_context", return_value=mock_context)
     mocker.patch("src.cleverswitch.cli.cli_module._setup_logging")
+    mocker.patch("src.cleverswitch.cli.cli_module.acquire_single_instance_lock")
     mock_thread_cls = mocker.patch("src.cleverswitch.cli.cli_module.threading.Thread")
     mock_thread_cls.return_value.start.side_effect = CleverSwitchError("boom")
 
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 1
+
+
+def test_main_exits_cleanly_when_another_instance_is_running(mocker, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["cleverswitch"])
+    mocker.patch("src.cleverswitch.cli.cli_module._setup_logging")
+    mocker.patch(
+        "src.cleverswitch.cli.cli_module.acquire_single_instance_lock",
+        side_effect=AlreadyRunningError("already running"),
+    )
+    mock_setup = mocker.patch("src.cleverswitch.cli.cli_module.setup_context")
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 0
+    mock_setup.assert_not_called()
